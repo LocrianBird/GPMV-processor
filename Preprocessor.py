@@ -71,9 +71,28 @@ def contrast_stretching(image):
     stretched_image = ((image - min_val) / (max_val - min_val)) * 255
     return stretched_image.astype(np.uint8)
 
-def find_contour_tailored(cropped_image, center, average_radius, radius_deviation=10, delta_brightness=60):
+def smooth_contour(points, window_size=5):
+    if len(points) < window_size:
+        return points
+    smoothed_points = []
+    for i in range(len(points)):
+        avg_x = np.mean([point[0] for point in points[max(0, i-window_size//2):min(len(points), i+window_size//2+1)]])
+        avg_y = np.mean([point[1] for point in points[max(0, i-window_size//2):min(len(points), i+window_size//2+1)]])
+        smoothed_points.append((int(avg_x), int(avg_y)))
+    return smoothed_points
+
+import numpy as np
+import math
+from skimage.draw import line
+
+import numpy as np
+import math
+from skimage.draw import line
+
+def find_contour_tailored(cropped_image, center, average_radius, radius_deviation=10, delta_brightness=15, window_size=5):
     """
-    Find the contour points around a given center in a cropped image by detecting significant luminosity changes.
+    Find the contour points around a given center in a cropped image by detecting the most significant increase in luminosity,
+    including a smoothing mechanism to reduce noise.
 
     Parameters:
         cropped_image (np.array): The cropped image around the region of interest.
@@ -81,51 +100,49 @@ def find_contour_tailored(cropped_image, center, average_radius, radius_deviatio
         average_radius (int): The average radius from the center to search for the contour.
         radius_deviation (int): The deviation from the average radius to define the search range.
         delta_brightness (int): The threshold for detecting a significant luminosity change.
+        window_size (int): The number of points on either side of the current point to consider for averaging.
 
     Returns:
         np.array: The array of points forming the detected contour.
     """
-    # Set up the angle step size
-    delta_angle = math.pi / 160  # Smaller step size for finer contour
+    delta_angle = 1/average_radius**2  # Angle step size
     contour_points = []
 
-    # Define start and end radius based on average and deviation
     start_radius = average_radius - radius_deviation
     end_radius = average_radius + radius_deviation
 
     for angle in np.arange(0, 2 * math.pi, delta_angle):
-        # Calculate start and end points for the line at the current angle
         start_x = int(center[0] + start_radius * math.cos(angle))
         start_y = int(center[1] + start_radius * math.sin(angle))
         end_x = int(center[0] + end_radius * math.cos(angle))
         end_y = int(center[1] + end_radius * math.sin(angle))
 
-        # Clamp values to ensure they remain within image bounds
+        # Ensure the coordinates are within image bounds
         start_x, start_y = np.clip([start_x, start_y], 0, np.array(cropped_image.shape[1::-1]) - 1)
         end_x, end_y = np.clip([end_x, end_y], 0, np.array(cropped_image.shape[1::-1]) - 1)
 
-        # Get coordinates of all points on the line from start to end
         line_x, line_y = line(start_x, start_y, end_x, end_y)
-        max_change = 0
+        values = cropped_image[line_y, line_x]
+
+        # Apply smoothing to the brightness values along the line
+        smoothed_values = np.convolve(values, np.ones(window_size) / window_size, mode='valid')
         best_point = None
-        previous_value = None
+        max_increase = 0
 
-        # Iterate through points on the line, looking for the largest luminosity change
-        for x, y in zip(line_x, line_y):
-            value = cropped_image[y, x]
-            if previous_value is not None:
-                brightness_change = abs(value - previous_value)
-                if brightness_change > max_change and brightness_change > delta_brightness:
-                    max_change = brightness_change
-                    best_point = (x, y)
-            previous_value = value
+        for i in range(1, len(smoothed_values)):
+            brightness_change = smoothed_values[i] - smoothed_values[i - 1]
+            # Look for the largest increase from dark to bright
+            if brightness_change > max_increase or brightness_change > delta_brightness:
+                max_increase = brightness_change
+                idx = i + window_size // 2  # Adjust index for the window
+                best_point = (line_x[idx], line_y[idx])
 
-        # Add the best point found (if any) to the contour points list
         if best_point:
             contour_points.append(best_point)
 
-    # Convert list of points to a suitable format for cv2 functions
     return np.array([contour_points], dtype=np.int32) if contour_points else np.array([], dtype=np.int32).reshape(-1, 1, 2)
+
+
 
 
 # D:\GPMV Data\19.03.2024\CaSki P15\_s1_44.tif
@@ -198,10 +215,10 @@ for i, image in enumerate(tifffile.imread("D:/GPMV Data/19.03.2024/CaSki P15/_s1
     cropped_segment = image[bounding_box[1]:bounding_box[1]+bounding_box[3]+1, bounding_box[0]:bounding_box[0]+bounding_box[2]+1]
     adjusted_center = (center[0] - bounding_box[0], center[1] - bounding_box[1])
     tailored_contour = find_contour_tailored(cropped_segment, adjusted_center, averaged_radius)
-    new_cropped_segment = cropped_segment
+    image = image
     print(len(tailored_contour))
     try:  # Check if contour is not empty
-        cv2.drawContours(new_cropped_segment, [tailored_contour], -1, (0, 255, 0), 1)
+        cv2.drawContours(cropped_segment, [tailored_contour], -1, (0, 255, 0), 1)
         cv2.imwrite(os.path.join(output_directory, f"{i}_tailored.png"), image)
     except Exception as e:
         print(f"No tailored contour found wit {e}")
