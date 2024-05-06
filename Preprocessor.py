@@ -71,69 +71,61 @@ def contrast_stretching(image):
     stretched_image = ((image - min_val) / (max_val - min_val)) * 255
     return stretched_image.astype(np.uint8)
 
-def find_contour_tailored(cropped_image, center, average_radius):
-    # Input parameters:
-    #   1. Image data cropped around membrane
-    #   2. Center - centroid of the membrane from cellpose
-    #   3. Average radius - average radius of the membrane from cellpose
-    # Output: list with points for contour of the membrane
-    # 0. Define delta for angle dA
-    # 1. Iterate over all angles [0, 2pi] with step dA
-    # 2. Calculate rX and rY - points in image for radius and angle
-    # 3. Iterate through all the points along the line at dA from the center to (rX,rY) with distance D = average_radius + 5px
-    # 4. Find a point where luminosity/intensity changes with at least dL points (abruptly, meaning the biggest change)
-    # 5. Add the point to the output array for contour, if found
-    # 6. Return all found points as a list
+def find_contour_tailored(cropped_image, center, average_radius, radius_deviation=10, delta_brightness=60):
+    """
+    Find the contour points around a given center in a cropped image by detecting significant luminosity changes.
 
-    # Important definitions
-    delta_angle = math.pi / 160
-    radius_deviation = 10
-    delta_luminosity = 8
+    Parameters:
+        cropped_image (np.array): The cropped image around the region of interest.
+        center (tuple): The (x, y) coordinates of the center of the region.
+        average_radius (int): The average radius from the center to search for the contour.
+        radius_deviation (int): The deviation from the average radius to define the search range.
+        delta_brightness (int): The threshold for detecting a significant luminosity change.
+
+    Returns:
+        np.array: The array of points forming the detected contour.
+    """
+    # Set up the angle step size
+    delta_angle = math.pi / 160  # Smaller step size for finer contour
     contour_points = []
 
-    # Iterate over all angles from 0 to 2*pi with step delta_angle
-    for angle in np.arange(0, 2 * math.pi, delta_angle):
-        # Calculate the x and y coordinates for the radius start and endpoint
-        start_radius = average_radius - radius_deviation
-        end_radius = average_radius + radius_deviation
+    # Define start and end radius based on average and deviation
+    start_radius = average_radius - radius_deviation
+    end_radius = average_radius + radius_deviation
 
+    for angle in np.arange(0, 2 * math.pi, delta_angle):
+        # Calculate start and end points for the line at the current angle
         start_x = int(center[0] + start_radius * math.cos(angle))
         start_y = int(center[1] + start_radius * math.sin(angle))
         end_x = int(center[0] + end_radius * math.cos(angle))
         end_y = int(center[1] + end_radius * math.sin(angle))
 
-        # Ensure the radius does not go out of image bounds
-        start_x = max(0, min(start_x, cropped_image.shape[1] - 1))
-        start_y = max(0, min(start_y, cropped_image.shape[0] - 1))
-        end_x = max(0, min(end_x, cropped_image.shape[1] - 1))
-        end_y = max(0, min(end_y, cropped_image.shape[0] - 1))
+        # Clamp values to ensure they remain within image bounds
+        start_x, start_y = np.clip([start_x, start_y], 0, np.array(cropped_image.shape[1::-1]) - 1)
+        end_x, end_y = np.clip([end_x, end_y], 0, np.array(cropped_image.shape[1::-1]) - 1)
 
-        # Create a line iterator to get points between start and end points
-        # line_iterator = cv2.lineIterator(cropped_image, (start_x, start_y), (end_x, end_y))
+        # Get coordinates of all points on the line from start to end
         line_x, line_y = line(start_x, start_y, end_x, end_y)
-
-        # Initialize variables to find the maximum luminosity change
         max_change = 0
         best_point = None
         previous_value = None
 
-        # Iterate through points along the line
+        # Iterate through points on the line, looking for the largest luminosity change
         for x, y in zip(line_x, line_y):
-            if 0 <= x < cropped_image.shape[1] and 0 <= y < cropped_image.shape[0]:
-                value = cropped_image[y, x]
-                print(value)
-                if previous_value is not None:
-                    luminosity_change = abs(int(value) - int(previous_value))
-                    if luminosity_change > max_change and luminosity_change > delta_luminosity:
-                        max_change = luminosity_change
-                        best_point = (x, y)
-                previous_value = value
+            value = cropped_image[y, x]
+            if previous_value is not None:
+                brightness_change = abs(value - previous_value)
+                if brightness_change > max_change and brightness_change > delta_brightness:
+                    max_change = brightness_change
+                    best_point = (x, y)
+            previous_value = value
 
+        # Add the best point found (if any) to the contour points list
         if best_point:
             contour_points.append(best_point)
 
-    contour_points = np.array([contour_points], dtype=np.uint8).reshape(-1, 1, 2)
-    return contour_points
+    # Convert list of points to a suitable format for cv2 functions
+    return np.array([contour_points], dtype=np.int32) if contour_points else np.array([], dtype=np.int32).reshape(-1, 1, 2)
 
 
 # D:\GPMV Data\19.03.2024\CaSki P15\_s1_44.tif
@@ -204,10 +196,15 @@ for i, image in enumerate(tifffile.imread("D:/GPMV Data/19.03.2024/CaSki P15/_s1
 
         # Crop the segmented image using the bounding rectangle
     cropped_segment = image[bounding_box[1]:bounding_box[1]+bounding_box[3]+1, bounding_box[0]:bounding_box[0]+bounding_box[2]+1]
-    try:
-        tailored_contour = find_contour_tailored(cropped_segment, center, averaged_radius)
-    except:
-        print("Tailored function crushed")
+    adjusted_center = (center[0] - bounding_box[0], center[1] - bounding_box[1])
+    tailored_contour = find_contour_tailored(cropped_segment, adjusted_center, averaged_radius)
+    new_cropped_segment = cropped_segment
+    print(len(tailored_contour))
+    try:  # Check if contour is not empty
+        cv2.drawContours(new_cropped_segment, [tailored_contour], -1, (0, 255, 0), 1)
+        cv2.imwrite(os.path.join(output_directory, f"{i}_tailored.png"), image)
+    except Exception as e:
+        print(f"No tailored contour found wit {e}")
     #cropped_segment = cv2.Sobel(src=cropped_segment, ddepth=cv2.CV_8U, dx=1, dy=1, ksize=7)
     #cropped_segment = np.vectorize(lambda x: 255 if x else 0)(feature.canny(cropped_segment, sigma=3)).astype(np.uint8)
     ret = cellpose(cropped_segment)
@@ -225,8 +222,6 @@ for i, image in enumerate(tifffile.imread("D:/GPMV Data/19.03.2024/CaSki P15/_s1
     # cv2.drawContours(image, [max_contour], -1, (0, 0, 0), thickness=1)
     cv2.drawContours(cropped_segment, [new_contour], -1, (0, 0, 0), thickness=1)
     cv2.imwrite(os.path.join(output_directory, f"{i}.tif"), image)
-    cv2.drawContours(cropped_segment, [tailored_contour], -1, (0, 255, 0), thickness=1)
-    cv2.imwrite(os.path.join(output_directory, f"{i}_tailored.tif"), image)
     # cv2.imwrite("2.png", image2)
 
 
