@@ -10,10 +10,10 @@ from random import randint
 import cv2
 import numpy as np
 import tifffile
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 from cellpose import models
-from skimage.draw import line
-from skimage import feature
+from skimage.draw import line_aa
+from skimage import filters
 
 # Read the image
 
@@ -89,7 +89,12 @@ import numpy as np
 import math
 from skimage.draw import line
 
-def find_contour_tailored(cropped_image, center, average_radius, radius_deviation=10, delta_brightness=15, window_size=5):
+def find_contour_tailored(cropped_image,
+                          center,
+                          average_radius,
+                          radius_deviation=10,
+                          delta_brightness=5,
+                          window_size=5):
     """
     Find the contour points around a given center in a cropped image by detecting the most significant increase in luminosity,
     including a smoothing mechanism to reduce noise.
@@ -105,23 +110,23 @@ def find_contour_tailored(cropped_image, center, average_radius, radius_deviatio
     Returns:
         np.array: The array of points forming the detected contour.
     """
-    delta_angle = 1/average_radius**2  # Angle step size
+    delta_angle = 1 / average_radius**2  # Angle step size
     contour_points = []
 
     start_radius = average_radius - radius_deviation
     end_radius = average_radius + radius_deviation
 
     for angle in np.arange(0, 2 * math.pi, delta_angle):
-        start_x = int(center[0] + start_radius * math.cos(angle))
-        start_y = int(center[1] + start_radius * math.sin(angle))
-        end_x = int(center[0] + end_radius * math.cos(angle))
-        end_y = int(center[1] + end_radius * math.sin(angle))
+        start_x = round(center[0] + start_radius * math.cos(angle))
+        start_y = round(center[1] + start_radius * math.sin(angle))
+        end_x = round(center[0] + end_radius * math.cos(angle))
+        end_y = round(center[1] + end_radius * math.sin(angle))
 
         # Ensure the coordinates are within image bounds
         start_x, start_y = np.clip([start_x, start_y], 0, np.array(cropped_image.shape[1::-1]) - 1)
         end_x, end_y = np.clip([end_x, end_y], 0, np.array(cropped_image.shape[1::-1]) - 1)
 
-        line_x, line_y = line(start_x, start_y, end_x, end_y)
+        line_x, line_y, _ = line_aa(start_x, start_y, end_x, end_y)
         values = cropped_image[line_y, line_x]
 
         # Apply smoothing to the brightness values along the line
@@ -141,6 +146,8 @@ def find_contour_tailored(cropped_image, center, average_radius, radius_deviatio
             contour_points.append(best_point)
 
     return np.array([contour_points], dtype=np.int32) if contour_points else np.array([], dtype=np.int32).reshape(-1, 1, 2)
+
+
 
 
 
@@ -214,16 +221,20 @@ for i, image in enumerate(tifffile.imread("D:/GPMV Data/19.03.2024/CaSki P15/_s1
         # Crop the segmented image using the bounding rectangle
     cropped_segment = image[bounding_box[1]:bounding_box[1]+bounding_box[3]+1, bounding_box[0]:bounding_box[0]+bounding_box[2]+1]
     adjusted_center = (center[0] - bounding_box[0], center[1] - bounding_box[1])
-    tailored_contour = find_contour_tailored(cropped_segment, adjusted_center, averaged_radius)
-    image = image
+    tailored_contour = find_contour_tailored(cropped_segment,
+                                             adjusted_center,
+                                             averaged_radius,
+                                             10,
+                                             5,
+                                             5)
     print(len(tailored_contour))
     try:  # Check if contour is not empty
-        cv2.drawContours(cropped_segment, [tailored_contour], -1, (0, 255, 0), 1)
+        cv2.drawContours(cropped_segment, [tailored_contour], -1, (0, 0, 0), 1)
         cv2.imwrite(os.path.join(output_directory, f"{i}_tailored.png"), image)
     except Exception as e:
         print(f"No tailored contour found wit {e}")
-    #cropped_segment = cv2.Sobel(src=cropped_segment, ddepth=cv2.CV_8U, dx=1, dy=1, ksize=7)
-    #cropped_segment = np.vectorize(lambda x: 255 if x else 0)(feature.canny(cropped_segment, sigma=3)).astype(np.uint8)
+    # cropped_segment = cv2.Sobel(src=cropped_segment, ddepth=cv2.CV_8U, dx=1, dy=1, ksize=7)
+    # cropped_segment = np.vectorize(lambda x: 255 if x else 0)(feature.canny(cropped_segment, sigma=3)).astype(np.uint8)
     ret = cellpose(cropped_segment)
     if ret:
         new_contour, nb, averaged_radius, undulations, _ = ret
@@ -238,7 +249,7 @@ for i, image in enumerate(tifffile.imread("D:/GPMV Data/19.03.2024/CaSki P15/_s1
     # cropped_segment = image2[bounding_box[1]:bounding_box[1]+bounding_box[3]+1, bounding_box[0]:bounding_box[0]+bounding_box[2]+1]
     # cv2.drawContours(image, [max_contour], -1, (0, 0, 0), thickness=1)
     cv2.drawContours(cropped_segment, [new_contour], -1, (0, 0, 0), thickness=1)
-    cv2.imwrite(os.path.join(output_directory, f"{i}.tif"), image)
+    cv2.imwrite(os.path.join(output_directory, f"{i}.png"), image)
     # cv2.imwrite("2.png", image2)
 
 
