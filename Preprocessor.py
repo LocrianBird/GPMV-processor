@@ -18,6 +18,12 @@ from cellpose import models
 from skimage.draw import line_aa
 from skimage import filters
 import itertools
+from scipy.signal import savgol_filter, medfilt
+from scipy.ndimage import gaussian_filter1d, gaussian_filter
+from numpy import convolve, ones
+from skimage.measure import find_contours
+import sympy as sy
+import sympy.geometry as gm
 
 
 # Read the image
@@ -98,6 +104,112 @@ from skimage.draw import line
 import numpy as np
 import math
 from skimage.draw import line
+
+model = models.Cellpose(gpu=True, model_type='cyto')
+
+def adjust_contour_to_membrane(image: np.ndarray, contour_coords: np.ndarray, centroid: tuple[int, int]) -> np.ndarray:
+    def perp(a):
+        b = np.empty_like(a)
+        b[0] = -a[1]
+        b[1] = a[0]
+        return b
+
+    # line segment a given by endpoints a1, a2
+    # line segment b given by endpoints b1, b2
+    # return
+    def seg_intersect(a1, a2, b1, b2):
+        start_x = max(min(a1[0], a2[0]), min(b1[0], b2[0]))
+        end_x = min(max(a1[0], a2[0]), max(b1[0], b2[0]))
+        start_y = max(min(a1[1], a2[1]), min(b1[1], b2[1]))
+        end_y = min(max(a1[1], a2[1]), max(b1[1], b2[1]))
+        if start_x > end_x or start_y > end_y:
+            return None
+
+        da = a2 - a1
+        db = b2 - b1
+        dp = a1 - b1
+        dap = perp(da)
+        denom = np.dot(dap, db)
+        num = np.dot(dap, dp)
+        out = (num / denom.astype(float)) * db + b1
+        return None if any(map(lambda x: math.isnan(x), out)) else out if start_x <= out[0] <= end_x and start_y <= out[1] <= end_y else None
+
+    """
+    :param image:
+    :param contour_coords: shape (1, 1, 2)
+    :param centroid:
+    :return:
+    """
+
+    out = []
+    offset = 10
+    start_radius = 75
+    delta_angle = math.radians(30)
+    box_length = 20
+
+    for angle in np.arange(0, 2 * math.pi, math.radians(10)):
+        start_x = round(centroid[0] + start_radius * math.cos(angle))  # rename later
+        start_y = round(centroid[1] + start_radius * math.sin(angle))  # rename later :c
+        inter_point = None
+        for start, end in zip(contour_coords, contour_coords[1:]):
+            inter_point = seg_intersect(np.array(centroid), np.array([start_x, start_y]), start[0], end[0])
+            if inter_point is not None:
+                break
+
+        if inter_point is not None:
+            inter_radius = math.dist(centroid, inter_point)
+            inter_radius -= offset
+            left_line_start_x = round(centroid[0] + inter_radius * math.cos(angle-delta_angle))
+            left_line_start_y = round(centroid[1] + inter_radius * math.sin(angle-delta_angle))
+            right_line_start_x = round(centroid[0] + inter_radius * math.cos(angle+delta_angle))
+            right_line_start_y = round(centroid[1] + inter_radius * math.sin(angle+delta_angle))
+            abs_end_x = round(box_length*math.cos(angle))
+            abs_end_y = round(box_length*math.sin(angle))
+            left_line_end_x = left_line_start_x + abs_end_x
+            left_line_end_y = left_line_start_y + abs_end_y
+            right_line_end_x = right_line_start_x + abs_end_x
+            right_line_end_y = right_line_start_y + abs_end_y
+            left_line = list(zip(*line(left_line_start_x, left_line_start_y, left_line_end_x, left_line_end_y)))
+            right_line = list(zip(*line(right_line_start_x, right_line_start_y, right_line_end_x, right_line_end_y)))
+            s = left_line + right_line
+            all_xs = list(map(lambda x: x[0], s))
+            all_ys = list(map(lambda x: x[1], s))
+            min_x, max_x = min(all_xs), max(all_xs)
+            min_y, max_y = min(all_ys), max(all_ys)
+
+            last_value = None
+            candidate = None
+            last_pair = None
+            checked = 0
+            for idx, (left_point, right_point) in enumerate(zip(left_line, right_line)):
+                cross = np.max(image[*map(lambda x: np.array(x), line(*left_point, *right_point))])
+
+                if last_value is not None:
+                    if cross - last_value > 20:
+                        if candidate is None:
+                            candidate = last_pair
+
+                        if checked == 5:
+                            break
+
+                        checked += 1
+
+                    elif candidate is not None:
+                        checked = 0
+                        last_value = cross
+                        candidate = None
+                    else:
+                        last_value = cross
+                        last_pair = (left_point, right_point)
+                else:
+                    last_value = cross
+                    last_pair = (left_point, right_point)
+
+            if candidate is not None:
+                inter_point = seg_intersect(np.array(centroid), np.array([start_x, start_y]), np.array(candidate[0]), np.array(candidate[1]))
+                if inter_point is not None:
+                    out.append(inter_point)
+    return None if len(out) == 0 else np.array(out).reshape((-1, 1, 2)).astype(np.int32)
 
 
 def find_contour_tailored(cropped_image,
@@ -201,33 +313,90 @@ def read_file_random_frame(iteration: Iteration) -> Iteration:
     iteration.image = Image(name=image_name, data=normalized.astype(np.uint8))
     return iteration
 
+from scipy.interpolate import splprep, splev
+
+
+def is_valid(iteration_ordered: IterationOrdered) -> bool:
+    data = list(iteration_ordered.image.data.flatten())
+    return not ((data.count(0) / float(len(data)) >= 0.5) or (data.count(255) / float(len(data)) >= 0.5))
+
 def find_max_valid_contour_ordered(contours: tuple[list, ...]) -> Optional[ContourData]:
     max_contour = None
     contours = list(contours)
     contours.sort(key=cv2.contourArea, reverse=True)
     for contour in contours:
-        peri = cv2.arcLength(contour, True)
-        contour = cv2.approxPolyDP(contour, 0.0065*peri, True)
+        # peri = cv2.arcLength(contour, True)
+        # contour = cv2.approxPolyDP(contour, 0.0065*peri, True)
+        # Convert contour to a numpy
+        if len(contour) < 5:
+            print("Not enough points on a contour")
+            continue
+
+        # image = np.zeros((512, 512), dtype=np.uint8)
+        # cv2.drawContours(image, [contour], -1, (255, 255, 255), thickness=1)
+        # cv2.imshow("", image)
+        # cv2.waitKey()
+
+        # temp = contour.reshape(-1, 2)
+        # tck, u = splprep([temp[:,0], temp[:,1]], s=35)
+        #
+        # # Evaluate spline on the parametric range
+        # new_points = splev(np.linspace(0, 1, 100), tck)
+        #
+        # # Draw the smooth curve
+        # contour = np.array(new_points).T.reshape(-1, 1, 2).astype(np.int32)
+        # image = np.zeros((512, 512), dtype=np.uint8)
+        # cv2.drawContours(image, [contour], -1, (255, 255, 255), thickness=1)
+        # cv2.imshow("", image)
+        # cv2.waitKey()
+
         center, _ = cv2.minEnclosingCircle(contour)
         radii = [math.dist(center, p[0]) for p in contour]
         averaged_radius = np.mean(radii)
-        if averaged_radius > 70:
+
+
+        # area = cv2.contourArea(contour)
+        # perimeter = cv2.arcLength(contour, True)
+        # if perimeter == 0:
+        #     continue  # Avoid division by zero
+        # circularity = 4 * np.pi * (area / (perimeter * perimeter))
+        # if 0.95 >= circularity >= 1.05:
+        #     print(f"Not circular {circularity}")]
+        #     continue
+        ellipse = cv2.fitEllipse(contour)
+        ellipse_contour = cv2.ellipse2Poly((int(ellipse[0][0]), int(ellipse[0][1])),
+                                           (int(ellipse[1][0] / 2), int(ellipse[1][1] / 2)),
+                                           int(ellipse[2]), 0, 360, 1)
+        matching = cv2.matchShapes(contour, ellipse_contour, 1, 0.0)
+        if matching > 0.2:
+            print(f"Not circular {matching}")
+            continue
+        elif averaged_radius > 70:
             print("Too big")
             continue
         elif averaged_radius < 30:
             print("Too small")
             break
-        elif not cv2.isContourConvex(contour):
-            print("Not convex")
-            continue
+        # elif not cv2.isContourConvex(contour):
+        #     print("Not convex")
+        #     continue
 
         undulations = [radius - averaged_radius for radius in radii]
         abs_undulations = [abs(un) for un in undulations]
-        if max(abs_undulations) <= 5:
+        if max(abs_undulations) <= 10:
             max_contour = contour
             break
 
     if max_contour is not None:
+
+        # window_length = 7
+        #
+        # # Apply Gaussian Filter
+        # smoothed_x = gaussian_filter(max_contour[..., 0, 0], sigma=window_length // 6, mode='wrap')
+        # smoothed_y = gaussian_filter(max_contour[..., 0, 1], sigma=window_length // 6, mode='wrap')
+        #
+        # # Reshape back to the original shape (1, 1, 2)
+        # max_contour = np.round(np.stack((smoothed_x, smoothed_y), axis=-1)).astype(np.int32).reshape(-1, 1, 2)
         contour_data = ContourData((round(center[0]), round(center[1])), averaged_radius, max_contour)
         print(f"Adequate contour found")
         return contour_data
@@ -237,18 +406,61 @@ def find_max_valid_contour_ordered(contours: tuple[list, ...]) -> Optional[Conto
 
 
 def preprocess_in_order(iteration_ordered: IterationOrdered) -> IterationOrdered:
-    def is_valid(iteration_ordered: IterationOrdered) -> bool:
-        data = list(iteration_ordered.image.data.flatten())
-        return not ((data.count(0) / float(len(data)) >= 0.5) or (data.count(255) / float(len(data)) >= 0.5))
 
     def preprocess_step(iteration_ordered: IterationOrdered) -> Optional[IterationOrdered]:
+        global model
+        ksizes = range(1, 14, 2)
+        sigmaXs = range(0, 7)
+        blockSizes = range(3, 30, 2)
+        cs = range(1, 7)
+        combination = list(itertools.product(ksizes, sigmaXs, blockSizes, cs))
+        combination.insert(0, (9, 0, 21, 1))
         if iteration_ordered.contour_data is None:
-            blur = cv2.GaussianBlur(iteration_ordered.image.data, (9, 9), 0)
-            thresh_image = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 1)
-            cnts = cv2.findContours(thresh_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cnts = cnts[0] if len(cnts) == 2 else cnts[1]
+            masks, _, _, _ = model.eval(iteration_ordered.image.data, diameter=None, channels=[0, 0])
+            masks = np.vectorize(lambda x: 0.0 if x > 0 else 1.0)(masks).astype(np.double)
+            cnts = find_contours(masks)
+            # blur = cv2.GaussianBlur(iteration_ordered.image.data, (ksize, ksize), sigmaX)
+            # thresh_image = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block_size, c)
+            # # if '16' in iteration_ordered.input_file:
+            # #     cv2.imshow("", thresh_image)
+            # #     cv2.waitKey()
+            # cnts = cv2.findContours(thresh_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in cnts:
+                for idx, (y, x) in enumerate(contour):
+                    contour[idx] = np.array((x, y))
+            cnts = tuple(map(lambda x: np.round(x).reshape((-1, 1, 2)).astype(np.int32), cnts))
+            # cnts = cnts[0] if len(cnts) == 2 else cnts[1]
             max_cnt = find_max_valid_contour_ordered(cnts)
             if max_cnt is not None:
+                # max_cnt.contour_coords = adjust_contour_to_membrane(iteration_ordered.image.data, max_cnt.contour_coords, cv2.minEnclosingCircle(max_cnt.contour_coords)[0])
+                # max_cnt.centroid = cv2.minEnclosingCircle(max_cnt.contour_coords)[0]
+                # max_cnt.averaged_radius = np.mean([math.dist(max_cnt.centroid, p[0]) for p in max_cnt.contour_coords])
+
+                bounding_box = cv2.boundingRect(max_cnt.contour_coords)
+                # Add [side] pixels to each side of the bounding rectangle
+                bounding_box = list(bounding_box)
+                side = 10
+                bounding_box[0] -= side
+                bounding_box[1] -= side
+                bounding_box[2] += side * 2
+                bounding_box[3] += side * 2
+
+                factor = 32
+                cutout = np.zeros((bounding_box[3] * factor, bounding_box[2] * factor), dtype=np.uint8)
+                for x in range(bounding_box[0], bounding_box[0] + bounding_box[2]):
+                    for y in range(bounding_box[1], bounding_box[1] + bounding_box[3]):
+                        sx, sy = (x - bounding_box[0]) * factor, (y - bounding_box[1]) * factor
+                        color = iteration_ordered.image.data[y, x]
+
+                        for nx in range(sx, sx + factor):
+                            for ny in range(sy, sy + factor):
+                                cutout[ny, nx] = color
+
+                        cv2.putText(cutout, str(color), (sx, sy + factor // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                    (0, 0, 0))
+
+                cv2.imwrite("output.png", cutout)
+
                 iteration_ordered.contour_data = max_cnt
                 cv2.drawContours(iteration_ordered.image.data, [max_cnt.contour_coords], -1, (0, 0, 0), 1)
             else:
@@ -266,12 +478,6 @@ def preprocess_in_order(iteration_ordered: IterationOrdered) -> IterationOrdered
             cropped_segment = iteration_ordered.image.data[bounding_box[1]:bounding_box[1] + bounding_box[3] + 1,
                               bounding_box[0]:bounding_box[0] + bounding_box[2] + 1]
 
-            ksizes = range(1, 14, 2)
-            sigmaXs = range(0, 7)
-            blockSizes = range(3, 30, 2)
-            cs = range(1, 7)
-            combination = list(itertools.product(ksizes, sigmaXs, blockSizes, cs))
-            combination.insert(0, (9, 0, 21, 1))
             for ksize, sigmaX, block_size, c in combination:
                 blur = cv2.GaussianBlur(cropped_segment, (ksize, ksize), sigmaX)
                 thresh_image = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block_size,
@@ -298,6 +504,10 @@ def process_in_order(iteration: Iteration):
     inp = IterationOrdered(iteration.input_file, iteration.output_dir, None, None)
     for index, frame in enumerate(tifffile.imread(iteration.input_file)):
         normalized = ((frame - frame.min()) * 255.0 / (frame.max() - frame.min())).astype(np.uint8)
+        data = list(normalized.flatten())
+        if sum(1 for x in data if x < 10 or x > 245) / len(data) >= 0.5:
+            print(f"Input file {iteration.input_file} is broken")
+            break
         image_name: str = f"{os.path.basename(os.path.dirname(iteration.input_file))}_{os.path.basename(iteration.input_file).removesuffix('.tif')}_{index}"
         inp.image = Image(image_name, normalized)
         for idx, fun in enumerate(pipe):
@@ -305,6 +515,7 @@ def process_in_order(iteration: Iteration):
             if idx < len(pipe) - 1 and inp is None:
                 print(f"Image {iteration.input_file} is invalid")
                 break
+        break
 
 
 def output_in_order(iteration_ordered: IterationOrdered) -> IterationOrdered:
@@ -399,7 +610,7 @@ def output(iteration: Iteration) -> None:
 # ]
 # execute(pipe, initial_data)
 
-read('D:/GPMV Data/14.03.2024/CaSki P14/_s1_12.tif',
+read('D:/GPMV Data',
             'C:/Users/mkana/Desktop/GPMV/GPMV_new/Segmented Membranes',
      [process_in_order])
 # output(preprocess(read_random("D:/GPMV Data")), "C:/Users/mkana/Desktop/GPMV/GPMV_new/Segmented Membranes")
@@ -408,7 +619,7 @@ sys.exit(0)
 
 # D:\GPMV Data\19.03.2024\CaSki P15\_s1_44.tif
 bounding_box = None
-model = models.Cellpose(gpu=True, model_type='cyto')
+
 
 
 def cellpose(image):
